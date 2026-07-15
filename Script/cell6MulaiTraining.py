@@ -1,3 +1,6 @@
+# ============================================================
+# KIKAI CASUAL-VIBE — TRAINING v3 (Qwen2.5-3B-Instruct)
+# ============================================================
 import os, gc, json, math, time, random, warnings, inspect, traceback
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 os.environ["TOKENIZERS_PARALLELISM"]  = "false"
@@ -11,15 +14,10 @@ import torch
 import trl
 from datasets import Dataset
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainerCallback,
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback,
 )
 from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import SFTConfig, SFTTrainer
-
-# 🆕 v7: HuggingFace Hub imports
 from huggingface_hub import HfApi, create_repo, login
 
 torch.cuda.empty_cache(); gc.collect()
@@ -27,14 +25,34 @@ torch.cuda.empty_cache(); gc.collect()
 print(f"🔍 TRL version: {trl.__version__}")
 
 # ============================================================
-# 🆕 v7: HUGGINGFACE CONFIG
+# 🎯 CONFIG (di-tune untuk Qwen2.5-3B-Instruct)
 # ============================================================
-HF_REPO_ID       = "IDINN/KiKai"
-HF_PATH_IN_REPO  = "adapter/universal-train"  # ← target folder di HF
-HF_PRIVATE       = True   # False kalau mau public
-HF_PUSH_EVERY_SAVE = True # auto-push tiap checkpoint
+BASE_MODEL       = "Qwen/Qwen2.5-3B-Instruct"  # 🆕 GANTI
+TRAIN_JSONL      = "/content/kikai_train.jsonl"
+RESPONSE_IDS_FN  = "/content/response_ids.json"
 
-# Verifikasi login HF
+OUTPUT_DIR       = "/content/KiKai-casual-adapter"
+
+MAX_SEQ_LEN      = 1024
+EPOCHS           = 2         # data besar, cepat converge
+LR               = 2e-4      # 🟡 3B model butuh LR sedikit lebih tinggi dari 7B
+MICRO_BATCH      = 2         # 🆕 3B lebih ringan, bisa naik dari 1
+GRAD_ACCUM       = 8         # 🆕 turunin dari 16 (effective batch tetep 16)
+EVAL_SUBSAMPLE   = 300
+LOGGING_STEPS    = 20
+WARMUP_RATIO     = 0.05
+
+IDENTITY_KEYWORDS = ["KiKai", "Idin Iskandar", "Idin"]
+
+# HuggingFace target
+HF_REPO_ID       = "IDINN/KiKai"
+HF_PATH_IN_REPO  = "adapter/casual-train"
+HF_PRIVATE       = True
+HF_PUSH_EVERY_SAVE = True
+
+# ============================================================
+# HF LOGIN CHECK
+# ============================================================
 print("\n🔐 Checking HuggingFace login...")
 try:
     hf_api = HfApi()
@@ -47,25 +65,20 @@ except Exception:
     user_info = hf_api.whoami()
     print(f"  ✅ Logged in as: {user_info['name']}")
 
-# Ensure repo & path exist
 print(f"\n🏗️  Ensuring repo: {HF_REPO_ID}")
-try:
-    create_repo(repo_id=HF_REPO_ID, repo_type="model", private=HF_PRIVATE, exist_ok=True)
-    print(f"  ✅ Repo ready: https://huggingface.co/{HF_REPO_ID}")
-    print(f"  📁 Target path: /{HF_PATH_IN_REPO}/ (auto-created saat upload)")
-except Exception as e:
-    print(f"  ❌ Gagal create repo: {e}")
-    raise
+create_repo(repo_id=HF_REPO_ID, repo_type="model", private=HF_PRIVATE, exist_ok=True)
+print(f"  ✅ Repo ready")
+print(f"  📁 Target path: /{HF_PATH_IN_REPO}/")
 
 # ============================================================
-# COLLATOR AUTO-DETECT (v6 code, unchanged)
+# COLLATOR AUTO-DETECT
 # ============================================================
 COLLATOR_CLS = None
 USE_COMPLETION_ONLY_CONFIG = False
 
 try:
     from trl import DataCollatorForCompletionOnlyLM as COLLATOR_CLS
-    print("  ✅ Collator: trl.DataCollatorForCompletionOnlyLM (legacy)")
+    print("  ✅ Collator: trl.DataCollatorForCompletionOnlyLM")
 except ImportError:
     try:
         from trl.trainer.utils import DataCollatorForCompletionOnlyLM as COLLATOR_CLS
@@ -74,36 +87,22 @@ except ImportError:
         sig = inspect.signature(SFTConfig.__init__)
         if 'completion_only_loss' in sig.parameters:
             USE_COMPLETION_ONLY_CONFIG = True
-            print("  ✅ Pake: SFTConfig(completion_only_loss=True) [TRL modern]")
+            print("  ✅ Pake: SFTConfig(completion_only_loss=True)")
 
 assert torch.cuda.is_available()
 gpu_cap = torch.cuda.get_device_capability(0)
 print(f"\n🖥️  GPU: {torch.cuda.get_device_name(0)} | SM: {gpu_cap[0]}.{gpu_cap[1]}")
 
-compute_dtype = torch.float16
-print(f"  🔒 compute_dtype: fp16 (T4 hard-force)")
+# Qwen2.5-3B kecil, kita bisa coba bf16 kalau SM >= 8, fallback fp16
+if gpu_cap[0] >= 8:
+    compute_dtype = torch.bfloat16
+    print(f"  ⚡ compute_dtype: bf16 (SM {gpu_cap[0]}.{gpu_cap[1]} support)")
+else:
+    compute_dtype = torch.float16
+    print(f"  🔒 compute_dtype: fp16 (T4 fallback)")
 
 # ============================================================
-# TRAINING CONFIG (v6 unchanged)
-# ============================================================
-BASE_MODEL       = "dphn/dolphin-2.9.2-qwen2-7b"
-TRAIN_JSONL      = "/content/kikai_train.jsonl"
-RESPONSE_IDS_FN  = "/content/response_ids.json"
-OUTPUT_DIR       = "/content/KiKai-adapter"
-
-MAX_SEQ_LEN      = 1024
-EPOCHS           = 3
-LR               = 2e-4
-MICRO_BATCH      = 1
-GRAD_ACCUM       = 16
-EVAL_SUBSAMPLE   = 200
-LOGGING_STEPS    = 20
-WARMUP_RATIO     = 0.05
-
-IDENTITY_KEYWORDS = ["KiKai", "Idin Iskandar", "Idin"]
-
-# ============================================================
-# DATASET LOADING (v6 unchanged)
+# DATASET LOADING
 # ============================================================
 print("\n📦 Loading dataset...")
 rows = []
@@ -112,17 +111,21 @@ with open(TRAIN_JSONL, encoding="utf-8") as f:
         line = line.strip()
         if line:
             rows.append(json.loads(line))
-print(f"  ✅ loaded rows: {len(rows)}")
+print(f"  ✅ loaded rows: {len(rows):,}")
 
 def is_identity_sample(row):
     text = " ".join(m.get("content", "") for m in row["messages"])
     return any(kw in text for kw in IDENTITY_KEYWORDS)
 
 n_identity = sum(1 for r in rows if is_identity_sample(r))
-print(f"  🎭 identity samples: {n_identity} ({100*n_identity/len(rows):.1f}%)")
+pct = 100 * n_identity / len(rows)
+print(f"  🎭 identity samples: {n_identity} ({pct:.1f}%)")
+
+if pct < 5:
+    print(f"  ⚠️  WARNING: identity <5%, KiKai bisa lupa jati diri!")
 
 print("\n🔤 Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
@@ -131,13 +134,14 @@ with open(RESPONSE_IDS_FN) as f:
     response_ids = json.load(f)
 print(f"  ✅ response_ids: {response_ids}")
 
+# Stratified split
 random.seed(42)
 identity_rows = [r for r in rows if is_identity_sample(r)]
 other_rows    = [r for r in rows if not is_identity_sample(r)]
 random.shuffle(identity_rows)
 random.shuffle(other_rows)
 
-n_eval_identity = min(25, max(5, len(identity_rows) // 10))
+n_eval_identity = min(30, max(5, len(identity_rows) // 10))
 n_eval_other    = min(EVAL_SUBSAMPLE - n_eval_identity, len(other_rows) // 20)
 
 eval_rows  = identity_rows[:n_eval_identity] + other_rows[:n_eval_other]
@@ -147,14 +151,15 @@ random.shuffle(eval_rows)
 
 train_ds = Dataset.from_list(train_rows)
 eval_ds  = Dataset.from_list(eval_rows)
-print(f"\n✅ Train: {len(train_ds)} | Eval: {len(eval_ds)}")
+print(f"\n✅ Train: {len(train_ds):,} | Eval: {len(eval_ds):,}")
+print(f"   Eval identity: {n_eval_identity} | Eval other: {n_eval_other}")
 
 del rows, identity_rows, other_rows, train_rows, eval_rows; gc.collect()
 
 # ============================================================
-# MODEL LOADING (v6 unchanged)
+# MODEL LOADING (Qwen2.5-3B-Instruct)
 # ============================================================
-print("\n🤖 Loading Dolphin-Qwen2-7B (4bit NF4)...")
+print(f"\n🤖 Loading {BASE_MODEL} (4bit NF4)...")
 
 bnb = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -169,7 +174,8 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     low_cpu_mem_usage=True,
     attn_implementation="sdpa",
-    torch_dtype=torch.float16,
+    torch_dtype=compute_dtype,
+    trust_remote_code=True,
 )
 model.config.use_cache = False
 model.config.pretraining_tp = 1
@@ -182,6 +188,7 @@ model = prepare_model_for_kbit_training(
 if hasattr(model, "enable_input_require_grads"):
     model.enable_input_require_grads()
 
+# LoRA config — sama kayak universal, module Qwen2.5 identik sama Qwen2
 peft_config = LoraConfig(
     r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
     task_type="CAUSAL_LM",
@@ -190,7 +197,7 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# CALLBACKS (v6 + 🆕 v7 HF Push)
+# CALLBACKS
 # ============================================================
 class VRAMCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -207,13 +214,10 @@ class HeartbeatCallback(TrainerCallback):
         if state.global_step % self.interval == 0 and state.global_step > 0:
             elapsed = time.time() - self.start
             rate = state.global_step / max(elapsed, 1)
-            eta  = (state.max_steps - state.global_step) / max(rate, 0.001)
-            print(f"  💓 step {state.global_step}/{state.max_steps} | ETA: {eta/60:.1f}min")
+            eta = (state.max_steps - state.global_step) / max(rate, 0.001)
+            print(f"  💓 step {state.global_step}/{state.max_steps} | ETA: {eta/60:.1f}min | speed: {rate:.2f} it/s")
 
-# 🆕 v7: Auto-push ke HuggingFace tiap save
 class HuggingFacePushCallback(TrainerCallback):
-    """Push adapter ke HF tiap kali trainer save checkpoint."""
-
     def __init__(self, repo_id, path_in_repo, tokenizer, output_dir):
         self.repo_id = repo_id
         self.path_in_repo = path_in_repo
@@ -223,11 +227,8 @@ class HuggingFacePushCallback(TrainerCallback):
         self.push_count = 0
 
     def _push_adapter(self, adapter_dir, tag=""):
-        """Upload adapter folder ke HF."""
         try:
-            print(f"\n  📤 [HF Push #{self.push_count + 1}] Uploading {adapter_dir} → {self.repo_id}/{self.path_in_repo}/")
-
-            # Save tokenizer bareng biar folder self-contained
+            print(f"\n  📤 [HF Push #{self.push_count + 1}] {adapter_dir} → {self.repo_id}/{self.path_in_repo}/")
             try:
                 self.tokenizer.save_pretrained(adapter_dir)
             except Exception as e:
@@ -238,26 +239,19 @@ class HuggingFacePushCallback(TrainerCallback):
                 path_in_repo=self.path_in_repo,
                 repo_id=self.repo_id,
                 repo_type="model",
-                commit_message=f"auto: checkpoint push {tag}".strip(),
+                commit_message=f"auto: casual-train checkpoint {tag}".strip(),
                 ignore_patterns=[
-                    "checkpoint-*",
-                    "*.pyc",
-                    "runs/*",
-                    "optimizer.pt",
-                    "scheduler.pt",
-                    "rng_state.pth",
-                    "*.tmp",
+                    "checkpoint-*", "*.pyc", "runs/*",
+                    "optimizer.pt", "scheduler.pt", "rng_state.pth", "*.tmp",
                 ],
             )
             self.push_count += 1
-            print(f"     ✅ Pushed! Total pushes: {self.push_count}")
+            print(f"     ✅ Pushed! Total: {self.push_count}")
             print(f"     🔗 https://huggingface.co/{self.repo_id}/tree/main/{self.path_in_repo}")
         except Exception as e:
-            print(f"     ❌ Push failed (training tetep lanjut): {e}")
+            print(f"     ❌ Push failed (training lanjut): {e}")
 
     def on_save(self, args, state, control, **kwargs):
-        """Dipanggil setiap kali Trainer save checkpoint."""
-        # Cari checkpoint terbaru yang baru aja disave
         ckpts = [d for d in os.listdir(self.output_dir) if d.startswith("checkpoint-")]
         if not ckpts:
             return
@@ -266,14 +260,17 @@ class HuggingFacePushCallback(TrainerCallback):
         self._push_adapter(ckpt_path, tag=f"step-{state.global_step}")
 
 steps_per_epoch = max(1, math.ceil(len(train_ds) / (MICRO_BATCH * GRAD_ACCUM)))
-total_steps     = steps_per_epoch * EPOCHS
-eval_every = max(100, steps_per_epoch // 2)
+total_steps = steps_per_epoch * EPOCHS
+eval_every = max(100, steps_per_epoch // 3)
 print(f"\n📊 Plan: {steps_per_epoch} steps/epoch × {EPOCHS} = {total_steps} total")
 print(f"  💾 Save & HF push tiap: {eval_every} step")
 
 # ============================================================
-# SFT CONFIG (v6 unchanged)
+# SFT CONFIG
 # ============================================================
+use_bf16 = compute_dtype == torch.bfloat16
+use_fp16 = compute_dtype == torch.float16
+
 sft_all_kwargs = dict(
     output_dir=OUTPUT_DIR,
     num_train_epochs=EPOCHS,
@@ -289,8 +286,8 @@ sft_all_kwargs = dict(
     warmup_ratio=WARMUP_RATIO,
     max_grad_norm=0.3,
     weight_decay=0.0,
-    fp16=True,
-    bf16=False,
+    fp16=use_fp16,
+    bf16=use_bf16,
     tf32=False,
     logging_steps=LOGGING_STEPS,
     logging_first_step=True,
@@ -320,17 +317,16 @@ sft_valid_params = set(sft_sig.parameters.keys())
 sft_kwargs = {k: v for k, v in sft_all_kwargs.items() if k in sft_valid_params}
 dropped = set(sft_all_kwargs.keys()) - set(sft_kwargs.keys())
 if dropped:
-    print(f"\n⚠️  Dropped args (gak didukung TRL {trl.__version__}): {dropped}")
+    print(f"\n⚠️  Dropped args: {dropped}")
 
 args = SFTConfig(**sft_kwargs)
 print(f"✅ SFTConfig built with {len(sft_kwargs)} args")
 
 # ============================================================
-# TRAINER SETUP (v6 + 🆕 v7 HF callback)
+# TRAINER SETUP
 # ============================================================
 callbacks_list = [VRAMCallback(), HeartbeatCallback(interval=50)]
 
-# 🆕 v7: Tambah HF push callback
 if HF_PUSH_EVERY_SAVE:
     hf_callback = HuggingFacePushCallback(
         repo_id=HF_REPO_ID,
@@ -368,8 +364,8 @@ if COLLATOR_CLS is not None and not USE_COMPLETION_ONLY_CONFIG:
 
 trainer = SFTTrainer(**trainer_all_kwargs)
 
-# FP32 cast (v6 unchanged)
-print("\n🔧 Casting trainable params ke FP32 (T4 AMP compat)...")
+# FP32 cast untuk trainable params (safety buat AMP)
+print("\n🔧 Casting trainable params ke FP32...")
 n_cast = 0
 for name, param in trainer.model.named_parameters():
     if param.requires_grad:
@@ -382,14 +378,8 @@ trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad
 total     = sum(p.numel() for p in trainer.model.parameters())
 print(f"\n🧬 Trainable: {trainable/1e6:.2f}M / {total/1e6:.2f}M ({100*trainable/total:.3f}%)")
 
-dtype_counts = {}
-for p in trainer.model.parameters():
-    if p.requires_grad:
-        dtype_counts[str(p.dtype)] = dtype_counts.get(str(p.dtype), 0) + 1
-print(f"  Trainable dtype distribution: {dtype_counts}")
-
 # ============================================================
-# AUTO-RESUME (v6 unchanged)
+# AUTO-RESUME
 # ============================================================
 resume_from = None
 if os.path.isdir(OUTPUT_DIR):
@@ -400,9 +390,9 @@ if os.path.isdir(OUTPUT_DIR):
         print(f"\n🔄 Auto-resume dari: {resume_from}")
 
 # ============================================================
-# 🆕 v7: TRAINING dengan TRY/EXCEPT untuk force-push kalau crash
+# TRAINING dengan safety net
 # ============================================================
-print("\n🚀 STARTING TRAINING (with HF auto-push)")
+print(f"\n🚀 STARTING TRAINING: {BASE_MODEL} (with HF auto-push)")
 t0 = time.time()
 training_ok = False
 
@@ -420,7 +410,7 @@ except Exception as e:
     print("   Force push checkpoint terakhir ke HF...")
 
 # ============================================================
-# 🆕 v7: FINAL SAVE + FORCE PUSH (jalan meskipun training gagal)
+# FINAL SAVE + FORCE PUSH
 # ============================================================
 FINAL_DIR = f"{OUTPUT_DIR}-final"
 
@@ -430,7 +420,6 @@ try:
     print(f"\n💾 Adapter saved locally: {FINAL_DIR}")
 except Exception as e:
     print(f"\n⚠️  Local save failed: {e}")
-    # Fallback: pake checkpoint terakhir
     if os.path.isdir(OUTPUT_DIR):
         ckpts = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")]
         if ckpts:
@@ -438,7 +427,6 @@ except Exception as e:
             FINAL_DIR = os.path.join(OUTPUT_DIR, latest)
             print(f"   Fallback ke checkpoint: {FINAL_DIR}")
 
-# Force push final ke HF (bahkan kalau auto-push udah jalan)
 print(f"\n📤 FINAL PUSH ke HuggingFace...")
 try:
     hf_api.upload_folder(
@@ -446,7 +434,7 @@ try:
         path_in_repo=HF_PATH_IN_REPO,
         repo_id=HF_REPO_ID,
         repo_type="model",
-        commit_message=f"final: KiKai adapter {'(completed)' if training_ok else '(interrupted)'}",
+        commit_message=f"final: KiKai casual-train Qwen2.5-3B {'(completed)' if training_ok else '(interrupted)'}",
         ignore_patterns=[
             "checkpoint-*", "*.pyc", "runs/*",
             "optimizer.pt", "scheduler.pt", "rng_state.pth", "*.tmp",
@@ -456,17 +444,16 @@ try:
     print(f"🔗 https://huggingface.co/{HF_REPO_ID}/tree/main/{HF_PATH_IN_REPO}")
 except Exception as e:
     print(f"❌ Final push failed: {e}")
-    print("   Adapter tetep ada di local. Coba push manual nanti.")
 
 # ============================================================
-# IDENTITY TEST (v6 unchanged, cuma jalan kalau training sukses)
+# IDENTITY TEST
 # ============================================================
 if training_ok:
     print("\n🎭 IDENTITY TEST")
     model.config.use_cache = True
     model.eval()
 
-    for prompt in ["Siapa kamu?", "Kamu dibuat oleh siapa?", "Apa nama kamu?"]:
+    for prompt in ["Siapa kamu?", "Kamu dibuat oleh siapa?", "Apa nama kamu?", "Halo, perkenalkan diri kamu"]:
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
